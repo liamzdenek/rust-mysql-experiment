@@ -79,7 +79,7 @@ impl Connector {
         Ok(())
     }
 
-    pub fn query<T: Storable>(&mut self, query: &'static str) -> Result<Vec<T>, Error>{
+    pub fn query<X: TableMapper, T: Storable<X>>(&mut self, query: &'static str) -> Result<Vec<T>, Error>{
         println!("running query: {:?}", query);
         let c_query = CString::new(query).unwrap();
         unsafe{ mysql::mysql_query(self.mysql, c_query.as_ptr()) };
@@ -102,9 +102,8 @@ impl Connector {
             } else {
                 break;
             };
-            println!("ROW: {:?}", next.row);
 
-            let new = T::store(&rows.fields, next);
+            let new = T::store(next);
             results.push(new);
 
         }
@@ -120,14 +119,57 @@ impl Drop for Connector {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Fields {
     fields: Vec<mysql::st_mysql_field>,
+    remaining: Vec<(usize, String)>,
 }
 
 impl Fields {
     fn new(fields: Vec<mysql::st_mysql_field>) -> Self {
-        Fields{ fields: fields }
+        let mut ret = Fields{ fields: fields, remaining: vec![] };
+        ret.remaining = ret.get_all_tables();
+        ret
+    }
+
+    pub fn remove_remaining(&mut self) -> Vec<(usize, String)> {
+        self.remaining.drain(0..).collect()
+    }
+
+    //pub fn get_remaining_until_next_table_name
+
+    pub fn get_all_tables(&self) -> Vec<(usize, String)> {
+        let mut res = vec![];
+        for (i, row) in self.fields.iter().enumerate() {
+            let table = unsafe {
+                let table = CStr::from_ptr(row.table);
+                let table = table.to_str();
+                table.unwrap_or("").into()
+            };
+            res.push((i, table));
+        }
+        res
+    }
+}
+
+/*
+impl<A: Storable, B: Storable, T: TableMapper> Storable<T> for (A, B) {
+    fn store(row: Row) -> Self {
+        T::get_tables(row);
+        panic!("TODO");
+    }
+}
+*/
+
+pub trait TableMapper {
+    fn cols(row: &mut Row) -> Vec<(usize, String)>;
+}
+
+pub struct TMAll;
+
+impl TableMapper for TMAll {
+    fn cols(row: &mut Row) -> Vec<(usize, String)> {
+        row.fields.remove_remaining()
     }
 }
 
@@ -168,22 +210,86 @@ impl Drop for Rows {
 impl Iterator for Rows {
     type Item = Row;
     fn next(&mut self) -> Option<Self::Item> {
-        let row = unsafe{ mysql::mysql_fetch_row(self.res) as *mut mysql::st_mysql_rows };
+        let row = unsafe{ mysql::mysql_fetch_row(self.res) as mysql::MYSQL_ROW };
         if row.is_null() {
             return None;
         }
 
-        Some(Row{ row: row })
+        Some(Row{
+            row: row,
+            fields: self.fields.clone() // TODO: fix this with some irritating lifetime stuff
+        })
     }
 }
 
+#[derive(Debug)]
 pub struct Row {
-    row: *mut mysql::st_mysql_rows,
+    row: mysql::MYSQL_ROW,
+    //row: &[mysql::st_mysql_rows],
+    pub fields: Fields,
 }
 
+impl Row {
+    fn get_col_index(&self, cols: &mut Vec<(usize, String)>, col_name: &'static str) -> Option<usize> {
+        let mut found: Option<usize> = None;
+        for (i, tcol) in cols.iter().enumerate() {
+            //println!("COMPARING {:?} == {:?}", tcol.1, col_name);
 
-pub trait Storable {
-    fn store(&Fields, Row) -> Self;
+            let field = self.fields.fields[i]; // no bounds checking required
+            //println!("field: {:?}", field);
+            let field_name = unsafe{ CStr::from_ptr( field.name ) };
+            
+            /*
+            let row = unsafe {
+                slice::from_raw_parts(
+                    self.row,
+                    self.fields.fields.len() as usize
+                ).to_vec()
+            };
+            
+            println!("ROW: {:?}", row);
+
+            for cell in row.into_iter() {
+                let cstr = unsafe{ CStr::from_ptr(cell) };
+                println!("CELL: {:?}", cstr);
+            }
+            */
+
+            if field_name.to_string_lossy() == col_name {
+                found = Some(i);
+                break;
+            }
+        }
+        println!("FOUND IS SOME: {:?}", found);
+        if found.is_some() {
+            let tcol = cols.swap_remove(found.unwrap());
+            return Some(tcol.0);
+        }
+
+        None
+    }
+
+    pub fn get_u64(&self, cols: &mut Vec<(usize, String)>, col_name: &'static str) -> Option<u64> {
+        self.get_col_index(cols, col_name).and_then(|index| {
+            let cells = unsafe{ slice::from_raw_parts(self.row, self.fields.fields.len()) };
+            let cell_text = unsafe{ CStr::from_ptr(cells[index]) }.to_string_lossy();
+            println!("CELL: {:?}", cell_text);
+            Some(cell_text.parse().unwrap())
+        })
+    }
+
+    pub fn get_String(&self, cols: &mut Vec<(usize, String)>, col_name: &'static str) -> Option<String> {
+        self.get_col_index(cols, col_name).and_then(|index| {
+            let cells = unsafe{ slice::from_raw_parts(self.row, self.fields.fields.len()) };
+            let cell_text = unsafe{ CStr::from_ptr(cells[index]) }.to_string_lossy();
+            println!("CELL: {:?}", cell_text);
+            Some(cell_text.into_owned().into())
+        })
+    }
+}
+
+pub trait Storable<T: TableMapper> {
+    fn store(Row) -> Self;
 }
 
 #[derive(Debug)]
