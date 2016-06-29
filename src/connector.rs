@@ -232,31 +232,16 @@ pub struct Row {
 impl Row {
     fn get_col_index(&self, cols: &mut Vec<(usize, String)>, col_name: &'static str) -> Option<usize> {
         let mut found: Option<usize> = None;
-        for (i, tcol) in cols.iter().enumerate() {
-            //println!("COMPARING {:?} == {:?}", tcol.1, col_name);
+        println!("COLS: {:?}", cols);
+        for (cols_i, &(ref field_i, ref tcol)) in cols.iter().enumerate() {
 
-            let field = self.fields.fields[i]; // no bounds checking required
+            let field = self.fields.fields[*field_i]; // no bounds checking required
             //println!("field: {:?}", field);
             let field_name = unsafe{ CStr::from_ptr( field.name ) };
-            
-            /*
-            let row = unsafe {
-                slice::from_raw_parts(
-                    self.row,
-                    self.fields.fields.len() as usize
-                ).to_vec()
-            };
-            
-            println!("ROW: {:?}", row);
-
-            for cell in row.into_iter() {
-                let cstr = unsafe{ CStr::from_ptr(cell) };
-                println!("CELL: {:?}", cstr);
-            }
-            */
+            println!("COMPARING {:?} == {:?}", field_name, col_name);
 
             if field_name.to_string_lossy() == col_name {
-                found = Some(i);
+                found = Some(cols_i);
                 break;
             }
         }

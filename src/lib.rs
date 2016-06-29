@@ -11,7 +11,7 @@ mod tests {
         a: Option<String>,
         b: Option<String>,
         c: Option<String>,
-        d: Option<String>,
+        d: Option<u64>,
     }
 
     impl<T: TableMapper> Storable<T> for Post {
@@ -22,7 +22,7 @@ mod tests {
                 a:  row.get_String(&mut cols, "a"),
                 b:  row.get_String(&mut cols, "b"),
                 c:  row.get_String(&mut cols, "c"),
-                d:  row.get_String(&mut cols, "d"),
+                d:  row.get_u64   (&mut cols, "d"),
             }
         }
     }
