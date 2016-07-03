@@ -1,7 +1,6 @@
 use super::mysql;
 use std::ptr;
-use std::ffi::CString;
-use std::ffi::CStr;
+use std::ffi::{CString,CStr};
 use std::str;
 use std::slice;
 
@@ -79,7 +78,7 @@ impl Connector {
         Ok(())
     }
 
-    pub fn query<X: TableMapper, T: Storable<X>>(&mut self, query: &'static str) -> Result<Vec<T>, Error>{
+    pub fn query<T: Storable>(&mut self, query: &'static str) -> Result<Vec<T::Kind>, Error> {
         println!("running query: {:?}", query);
         let c_query = CString::new(query).unwrap();
         unsafe{ mysql::mysql_query(self.mysql, c_query.as_ptr()) };
@@ -93,7 +92,7 @@ impl Connector {
         let mut rows = try!(Rows::new(self.mysql, result));
         println!("fields: {:?}", rows.fields);
 
-        let mut results: Vec<T> = Vec::new();
+        let mut results = Vec::new();
 
         loop {
             let next = rows.next();
@@ -103,7 +102,7 @@ impl Connector {
                 break;
             };
 
-            let new = T::store(next);
+            let new = T::store(Box::new(next));
             results.push(new);
 
         }
@@ -116,51 +115,6 @@ impl Drop for Connector {
     fn drop(&mut self) {
         //println!("dropping {:?}", self.mysql);
         unsafe{ mysql::mysql_close(self.mysql) };
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Fields {
-    fields: Vec<mysql::st_mysql_field>,
-    remaining: Vec<(usize, String)>,
-}
-
-impl Fields {
-    fn new(fields: Vec<mysql::st_mysql_field>) -> Self {
-        let mut ret = Fields{ fields: fields, remaining: vec![] };
-        ret.remaining = ret.get_all_tables();
-        ret
-    }
-
-    pub fn remove_remaining(&mut self) -> Vec<(usize, String)> {
-        self.remaining.drain(0..).collect()
-    }
-
-    //pub fn get_remaining_until_next_table_name
-
-    pub fn get_all_tables(&self) -> Vec<(usize, String)> {
-        let mut res = vec![];
-        for (i, row) in self.fields.iter().enumerate() {
-            let table = unsafe {
-                let table = CStr::from_ptr(row.table);
-                let table = table.to_str();
-                table.unwrap_or("").into()
-            };
-            res.push((i, table));
-        }
-        res
-    }
-}
-
-pub trait TableMapper {
-    fn cols(row: &mut Row) -> Vec<(usize, String)>;
-}
-
-pub struct TMAll;
-
-impl TableMapper for TMAll {
-    fn cols(row: &mut Row) -> Vec<(usize, String)> {
-        row.fields.remove_remaining()
     }
 }
 
@@ -199,35 +153,69 @@ impl Drop for Rows {
 }
 
 impl Iterator for Rows {
-    type Item = Row;
+    type Item = RealRow;
     fn next(&mut self) -> Option<Self::Item> {
         let row = unsafe{ mysql::mysql_fetch_row(self.res) as mysql::MYSQL_ROW };
         if row.is_null() {
             return None;
         }
 
-        Some(Row{
+        Some(RealRow{
             row: row,
             fields: self.fields.clone() // TODO: fix this with some irritating lifetime stuff
         })
     }
 }
 
-#[derive(Debug)]
-pub struct Row {
-    row: mysql::MYSQL_ROW,
-    //row: &[mysql::st_mysql_rows],
-    pub fields: Fields,
+#[derive(Debug, Clone)]
+pub struct Fields {
+    fields: Vec<mysql::st_mysql_field>,
+    remaining: Vec<(usize, String)>,
 }
 
-impl Row {
-    fn get_col_index(&self, cols: &mut Vec<(usize, String)>, col_name: &'static str) -> Option<usize> {
+impl Fields {
+    fn new(fields: Vec<mysql::st_mysql_field>) -> Self {
+        let mut ret = Fields{ fields: fields, remaining: vec![] };
+        ret.remaining = ret.get_all_tables();
+        ret
+    }
+
+    pub fn get_all_tables(&self) -> Vec<(usize, String)> {
+        let mut res = vec![];
+        for (i, row) in self.fields.iter().enumerate() {
+            let table = unsafe {
+                let table = CStr::from_ptr(row.table);
+                let table = table.to_str();
+                table.unwrap_or("").into()
+            };
+            res.push((i, table));
+        }
+        res
+    }
+}
+
+pub trait Storable {
+    type Kind;
+    fn store(mut row: Box<Row>) -> Self::Kind; 
+}
+
+pub trait Row {
+    fn get_u64   (&mut self, &'static str) -> Option<u64>;
+    fn get_string(&mut self, &'static str) -> Option<String>;
+}
+
+pub struct RealRow {
+    row: mysql::MYSQL_ROW,
+    fields: Fields,
+}
+
+impl RealRow {
+    fn get_col_index(&mut self, col_name: &'static str) -> Option<usize> {
+        let mut cols = &mut self.fields.remaining;
         let mut found: Option<usize> = None;
-        println!("COLS: {:?}", cols);
         for (cols_i, &(ref field_i, ref tcol)) in cols.iter().enumerate() {
 
             let field = self.fields.fields[*field_i]; // no bounds checking required
-            //println!("field: {:?}", field);
             let field_name = unsafe{ CStr::from_ptr( field.name ) };
             println!("COMPARING {:?} == {:?}", field_name, col_name);
 
@@ -237,25 +225,24 @@ impl Row {
             }
         }
         println!("FOUND IS SOME: {:?}", found);
-        if found.is_some() {
-            let tcol = cols.swap_remove(found.unwrap());
-            return Some(tcol.0);
+        if found.is_none() {
+            return None;
         }
-
-        None
+        let tcol = cols.swap_remove(found.unwrap());
+        Some(tcol.0)
     }
-
-    pub fn get_u64(&self, cols: &mut Vec<(usize, String)>, col_name: &'static str) -> Option<u64> {
-        self.get_col_index(cols, col_name).and_then(|index| {
+}
+impl Row for RealRow {
+    fn get_u64(&mut self, col_name: &'static str) -> Option<u64> {
+        self.get_col_index(col_name).and_then(|index| {
             let cells = unsafe{ slice::from_raw_parts(self.row, self.fields.fields.len()) };
             let cell_text = unsafe{ CStr::from_ptr(cells[index]) }.to_string_lossy();
             println!("CELL: {:?}", cell_text);
             Some(cell_text.parse().unwrap())
         })
     }
-
-    pub fn get_String(&self, cols: &mut Vec<(usize, String)>, col_name: &'static str) -> Option<String> {
-        self.get_col_index(cols, col_name).and_then(|index| {
+    fn get_string(&mut self, col_name: &'static str) -> Option<String> {
+        self.get_col_index(col_name).and_then(|index| {
             let cells = unsafe{ slice::from_raw_parts(self.row, self.fields.fields.len()) };
             let cell_text = unsafe{ CStr::from_ptr(cells[index]) }.to_string_lossy();
             println!("CELL: {:?}", cell_text);
@@ -264,8 +251,19 @@ impl Row {
     }
 }
 
-pub trait Storable<T: TableMapper> {
-    fn store(Row) -> Self;
+pub struct VirtualRow {
+    row: mysql::MYSQL_ROW,
+    true_fields: Fields,
+    fields: Vec<(usize, String)>,
+}
+
+impl Row for VirtualRow {
+    fn get_u64(&mut self, col_name: &'static str) -> Option<u64> {
+        panic!("TODO");
+    }
+    fn get_string(&mut self, col_name: &'static str) -> Option<String> {
+        panic!("TODO");    
+    }
 }
 
 #[derive(Debug)]
@@ -291,3 +289,4 @@ fn get_error(mysql: *mut mysql::st_mysql) -> String {
 
     err.unwrap_or("").into()
 }
+
