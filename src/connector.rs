@@ -152,15 +152,6 @@ impl Fields {
     }
 }
 
-/*
-impl<A: Storable, B: Storable, T: TableMapper> Storable<T> for (A, B) {
-    fn store(row: Row) -> Self {
-        T::get_tables(row);
-        panic!("TODO");
-    }
-}
-*/
-
 pub trait TableMapper {
     fn cols(row: &mut Row) -> Vec<(usize, String)>;
 }
