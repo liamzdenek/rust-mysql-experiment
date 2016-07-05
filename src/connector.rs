@@ -3,6 +3,8 @@ use std::ptr;
 use std::ffi::{CString,CStr};
 use std::str;
 use std::slice;
+use std::marker::PhantomData;
+use std::borrow::BorrowMut;
 
 pub struct Connector {
     mysql: *mut mysql::st_mysql,
@@ -92,6 +94,8 @@ impl Connector {
         let mut rows = try!(Rows::new(self.mysql, result));
         println!("fields: {:?}", rows.fields);
 
+        Ok(T::store(rows))
+        /*
         let mut results = Vec::new();
 
         loop {
@@ -108,6 +112,7 @@ impl Connector {
         }
 
         Ok(results)
+        */
     }
 }
 
@@ -153,17 +158,17 @@ impl Drop for Rows {
 }
 
 impl Iterator for Rows {
-    type Item = RealRow;
+    type Item = Row;
     fn next(&mut self) -> Option<Self::Item> {
         let row = unsafe{ mysql::mysql_fetch_row(self.res) as mysql::MYSQL_ROW };
         if row.is_null() {
             return None;
         }
 
-        Some(RealRow{
+        Some(Row::RealRow(RealRow{
             row: row,
             fields: self.fields.clone() // TODO: fix this with some irritating lifetime stuff
-        })
+        }))
     }
 }
 
@@ -180,6 +185,35 @@ impl Fields {
         ret
     }
 
+    pub fn split(mut self, field: &'static str) -> (Vec<(usize, String)>, Vec<(usize, String)>) {
+        let mut found_first = false;
+        let mut found = false;
+        let mut left = vec![];
+        let mut right = vec![];
+
+        let iter = self.get_all_tables().into_iter().zip(
+            self.fields.iter()
+        );
+        for (i, (cell,row)) in iter.enumerate() {
+            let name = unsafe {
+                let name = CStr::from_ptr(row.name);
+                let name = name.to_str();
+                name.unwrap_or("")
+            };
+            println!("CMP {:?} == {:?}", name, field);
+            if !found_first && name == field {
+                found_first = true;
+                left.push(cell);
+            } else if found || name == field {
+                found = true;
+                right.push(cell);
+            } else {
+                left.push(cell);
+            }
+        }
+        (left, right)
+    }
+
     pub fn get_all_tables(&self) -> Vec<(usize, String)> {
         let mut res = vec![];
         for (i, row) in self.fields.iter().enumerate() {
@@ -194,15 +228,116 @@ impl Fields {
     }
 }
 
-pub trait Storable {
-    type Kind;
-    fn store(mut row: Box<Row>) -> Self::Kind; 
+pub trait RowSplitter {
+    fn split(row: Row) -> (Row, Row);
+    fn compare(a: Row, b: Row) -> bool;
 }
 
+pub struct RSNextId;
+
+impl RowSplitter for RSNextId {
+    fn split(row: Row) -> (Row, Row) {
+        match row {
+            Row::RealRow(row) => {
+                let (left, right) = row.fields.clone().split("id");
+                let left = VirtualRow{
+                    row: row.row,
+                    true_fields: row.fields.clone(),
+                    fields: left,
+                };
+                let right = VirtualRow{
+                    row: row.row,
+                    true_fields: row.fields,
+                    fields: right,
+                };
+                (
+                    Row::VirtualRow(left),
+                    Row::VirtualRow(right)
+                )
+            },
+            Row::VirtualRow(row) => {
+                panic!("TODO");
+            }
+        }
+    }
+    fn compare(a: Row, b: Row) -> bool {
+        panic!("TODO");
+    }
+}
+
+pub trait Storable {
+    type Kind;
+    fn store<T>(mut rows: T) -> Vec<Self::Kind> where T: Iterator<Item=Row>; 
+}
+
+pub struct LeftJoin<A: Storable,B: Storable,T: RowSplitter>{
+    _a: PhantomData<A>,
+    _b: PhantomData<B>,
+    _t: PhantomData<T>,
+}
+
+impl<A: Storable,B: Storable,S: RowSplitter> Storable for LeftJoin<A,B,S> {
+    type Kind = (A,Vec<B>);
+    fn store<T>(mut rows: T) -> Vec<Self::Kind> where T: Iterator<Item=Row>{
+        let ret = vec![];
+        let mut next = rows.next();
+        loop {
+            if next.is_none() {
+                break;
+            }
+            let (left, mut right) = S::split(next.unwrap());
+            let mut rvec = vec![];
+            loop {
+                if right.is_row_null() {
+                    break;
+                }
+                rvec.push(right);
+                next = rows.next();
+                if next.is_none() {
+                    break;
+                }
+                right = next.unwrap();
+            }
+            let sleft = A::store(vec![left].into());
+            let sright = B::store(rvec);
+            ret.push((sleft[0], sright));
+        }
+        ret
+    }
+}
+
+pub enum Row {
+    RealRow(RealRow),
+    VirtualRow(VirtualRow)
+}
+
+impl Row {
+    pub fn is_row_null(&self) -> bool {
+        match self {
+            &mut Row::RealRow(ref mut a)    => (a).is_row_null(),
+            &mut Row::VirtualRow(ref mut a) => (a).is_row_null(),
+        }
+    }
+    pub fn get_u64   (&mut self, col_name: &'static str) -> Option<u64> {
+        match self {
+            &mut Row::RealRow(ref mut a)    => (a).get_u64(col_name),
+            &mut Row::VirtualRow(ref mut a) => (a).get_u64(col_name),
+        }
+    }
+    pub fn get_string(&mut self, col_name: &'static str) -> Option<String> {
+        match self {
+            &mut Row::RealRow(ref mut a)    => (a).get_string(col_name),
+            &mut Row::VirtualRow(ref mut a) => (a).get_string(col_name),
+        }
+    }
+}
+
+/*
 pub trait Row {
     fn get_u64   (&mut self, &'static str) -> Option<u64>;
     fn get_string(&mut self, &'static str) -> Option<String>;
 }
+*/
 
 pub struct RealRow {
     row: mysql::MYSQL_ROW,
@@ -232,7 +367,7 @@ impl RealRow {
         Some(tcol.0)
     }
 }
-impl Row for RealRow {
+impl /*Row for*/ RealRow {
     fn get_u64(&mut self, col_name: &'static str) -> Option<u64> {
         self.get_col_index(col_name).and_then(|index| {
             let cells = unsafe{ slice::from_raw_parts(self.row, self.fields.fields.len()) };
@@ -257,7 +392,7 @@ pub struct VirtualRow {
     fields: Vec<(usize, String)>,
 }
 
-impl Row for VirtualRow {
+impl /*Row for*/ VirtualRow {
     fn get_u64(&mut self, col_name: &'static str) -> Option<u64> {
         panic!("TODO");
     }
